@@ -5,7 +5,7 @@
 
 
 <p align="center">
-<a href="https://github.com/watch-owl/WatchOwl/graphs/contributors">
+<a href="https://github.com/gpjdean/WatchOwl/graphs/contributors">
   <img alt="GitHub contributors" src="https://img.shields.io/github/contributors-anon/watch-owl/WatchOwl"/></a>
 <img alt="GitHub Repo stars" src="https://img.shields.io/github/stars/watch-owl/WatchOwl">
 <img alt="GitHub forks" src="https://img.shields.io/github/forks/watch-owl/WatchOwl">
@@ -16,7 +16,6 @@
 </p>
 
 
-> 💡 提示：仓库地址以 `watch-owl/WatchOwl` 作为占位，请按你实际的 GitHub 组织/仓库替换 README 与 CI 中的镜像命名空间和仓库链接。
 
 ## 💎 WatchOwl 是什么？
 
@@ -109,43 +108,6 @@ WatchOwl 采用前后端分离的云原生架构：
 
 WatchOwl 的前后端镜像同时支持 **linux/amd64** 与 **linux/arm64** 两种架构，可在 x86 服务器与 ARM（如鲲鹏、Apple Silicon、树莓派）环境上统一部署。
 
-| 组件 | 镜像                             | 架构                     |
-| ---- | -------------------------------- | ------------------------ |
-| 后端 | `watch-owl/watch-owl:latest`     | linux/amd64, linux/arm64 |
-| 前端 | `watch-owl/watch-owl-web:latest` | linux/amd64, linux/arm64 |
-
-> 镜像命名空间 `watch-owl/` 为示例，请按你自己的 Docker Hub 账号替换（CI 中的 `DOCKERHUB_USER` / `DOCKERHUB_TOKEN` Secret 同步更新）。
-
-多架构镜像通过 GitHub Actions + Docker Buildx 自动构建：
-
-- 打 tag（`v*`）触发 [release-ci](./backend/.github/workflows/release-ci.yml) / [前端 release-ci](./frontend/.github/workflows/release-ci.yml)，推送 `latest` 与版本号镜像。
-- 推送到 `master`/`main` 分支触发 test-ci，推送以分支名命名的镜像。
-
-后端 Dockerfile 使用 `--platform=${BUILDPLATFORM}` + `TARGETARCH` 让 Go 工具链在构建平台原生运行，通过 `GOARCH` 交叉编译目标架构，避免 QEMU 模拟整个 `go build`，arm64 构建提速明显。
-
-### 手动多架构构建
-
-```bash
-# 后端
-cd backend
-docker buildx build --platform linux/amd64,linux/arm64 \
-  --build-arg VERSION=v1.0.0 \
-  -t watch-owl/watch-owl:latest -t watch-owl/watch-owl:v1.0.0 \
-  --push .
-
-# 前端（Nginx 发布镜像）
-cd frontend
-docker buildx build --platform linux/amd64,linux/arm64 \
-  -t watch-owl/watch-owl-web:latest \
-  -f Dockerfile-nginx --push .
-```
-
-仅构建本机架构镜像用于本地验证：
-
-```bash
-docker build -t watch-owl/watch-owl:local .          # 后端
-docker build -f Dockerfile-nginx -t watch-owl/watch-owl-web:local .   # 前端
-```
 
 ## ⚡ 快速开始（Docker Compose）
 
