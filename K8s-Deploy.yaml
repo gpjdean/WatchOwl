@@ -1,0 +1,1314 @@
+# =============================================================================
+# WatchOwl 平台 - 单文件原生 YAML 部署清单
+# =============================================================================
+#
+# 适用版本：Kubernetes 1.25+  /  Helm chart 等价镜像标签
+# 文件作用：把 Helm chart (backend/deploy/helmchart) 转写为可独立
+#          `kubectl apply -f` 的纯 YAML，去掉 Go template，保留所有
+#          与 chart 等价的运行时语义（端口、probe、initContainer、环境
+#          变量注入、JWT 凭据策略、Nginx 反代规则）。
+#
+# 一键部署：
+#   kubectl apply -f watchowl-deploy.yaml
+#
+# 一键删除：
+#   kubectl delete -f watchowl-deploy.yaml
+#
+# -----------------------------------------------------------------------------
+# 文件结构（按 `---` 分段，便于裁剪）
+# -----------------------------------------------------------------------------
+#   §1  Namespace
+#   §2  Secret（JWT / 数据源加密 / mysql / redis / feishu 凭据; admin 口令默认不预置, 走首次引导）
+#   §3  ConfigMap (service 配置)
+#   §4  ConfigMap (frontend nginx 配置)
+#   §5  ServiceAccount
+#   §6  Deployment - watchowl-service（后端 Go 服务，9001）
+#   §7  Service    - watchowl-service（ClusterIP, 9001）
+#   §8  PDB        - watchowl-service（主动驱逐保护）
+#   §8b 云鸮终端   - watchowl-terminal（SA + ClusterRoleBinding + Agent Deployment/Service）
+#   §9  Deployment - watchowl-web（前端 Nginx，80）
+#   §10 Service    - watchowl-web（NodePort 30593 / ClusterIP）
+#   §11 Ingress    - watchowl-web（生产七层路由，可选，注释示例）
+#   §13 NetworkPolicy - 可选，默认注释（会阻断平台出站功能，见块内说明）
+#
+#   §A  内置 MySQL（可选，不依赖外部库）
+#   §B  内置 Redis（可选，不依赖外部库）
+#
+#   若 §A / §B 用你集群已存在的外部 MySQL / Redis，请注释或删除整段，
+#   并修改 §6 的 WATCHOWL_DB_HOST / WATCHOWL_REDIS_HOST。
+#
+# -----------------------------------------------------------------------------
+# 命名约定（与 helm chart 一致，便于平滑切换 chart/裸 yaml 两套方案）
+# -----------------------------------------------------------------------------
+#   - Namespace        : watchowl
+#   - Service 后端名    : watchowl-service （监听 9001）
+#   - Web 前端名       : watchowl-web      （监听 80）
+#   - ConfigMap service: watchowl-service-config（key: config.yaml）
+#   - ConfigMap web    : watchowl-web-config   （key: nginx.conf）
+#   - Secret           : watchowl-secrets
+#
+# -----------------------------------------------------------------------------
+# 镜像版本（升级方法）
+# -----------------------------------------------------------------------------
+#   镜像统一来自阿里云 ACR: registry.cn-beijing.aliyuncs.com/deanmr/watchowl
+#   语义 tag: service(后端) / web(前端) / terminal(云鸮终端)
+#   替换 §6 / §8b / §9 容器 image 的 tag 后执行:
+#     kubectl -n watchowl rollout restart deploy/watchowl-service deploy/watchowl-terminal deploy/watchowl-web
+#   (tag 名未变时 rollout restart 即可拉到新镜像; 若改成新 tag 则直接 apply)
+#
+# =============================================================================
+#                          §1  Namespace
+# =============================================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: watchowl
+  labels:
+    name: watchowl
+    purpose: observability            # 业务语义标签（监控告警平台）
+    tier: platform                    # 平台层
+    # pod-security 选 baseline：如需 restricted 级别，需要业务容器内置 USER 非 root
+    # 此处与 helm chart 一致不强行限制，避免 watchowl 默认以 root 启动时被拒。
+    # 上调到 restricted 的方法：
+    #   1. 业务镜像内 USER 1000 + runAsNonRoot:true
+    #   2. PSA 级别改成 restricted
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+
+---
+# =============================================================================
+#                          §2  Secret
+# =============================================================================
+# 注意：Secret 默认 base64 编码，仓库里看到的是编码后的值，不是明文。
+#       下面的 stringData 是明文写入，apply 后 API 会自动转 base64。
+#       生产请用 sealed-secrets / external-secrets / vault 接管，不要直接
+#       git 提交明文密钥。
+#
+# 必填键 4 个：jwtSignKey / datasourceEncryptionKey / dbPassword / agentToken；
+# 其余均为可选。admin 初始口令默认不预置：后端检测到库中无 admin 用户时会跳过建号，
+# 首次打开页面由前端「初始化管理员」界面（公开端点 /api/system/initAdmin）引导设置密码，
+# 因此下方不再提供 adminPassword 条目；自动化部署等需要预置口令时再按注释自行加回。
+apiVersion: v1
+kind: Secret
+metadata:
+  name: watchowl-secrets
+  namespace: watchowl
+  annotations:
+    kubernetes.io/encryption: "true"  # 标记需要静态加密
+type: Opaque
+stringData:
+  # 【必填】JWT 签名密钥：openssl rand -hex 32 生成，满足 ≥32 位要求。
+  # 留空时后端会生成进程内临时随机密钥：重启后所有登录 Token 失效，
+  # 多副本部署因各副本密钥不一致会互相踢掉登录态，因此生产必须显式提供。
+  # 禁止提交真实值；部署前自行替换占位符 <>
+  jwtSignKey: "<>"
+
+  # 【必填】数据源凭据加密密钥：必须恰好 32 字节原文（AES-256），openssl rand -hex 32 生成。
+  # 留空时后端无法加密落库监控凭据（启动即报错）；
+  # 所有后端副本必须使用相同 active key、key ID 和历史 keyring；密钥丢失后已有密文无法恢复。
+  # 禁止提交真实值；部署前自行替换占位符 <>
+  datasourceEncryptionKey: "<>"
+  # 【可选】历史 keyring 格式：old-id=<key>,older-id=<key>。轮换时先保留旧 key，再切换 active key/ID。
+  datasourceEncryptionKeys: ""
+
+  # 【可选】内置超管 admin 的初始口令：默认不预置，留空走首次打开页面的引导设置。
+  # 仅自动化部署等需要预置口令的场景再启用下面一行（首次建号生效，之后在「人员管理」修改）：
+  # adminPassword: "<>"
+
+  # 【必填】数据库口令：service.config 已刻意留空 pass 字段，由环境变量 WATCHOWL_DB_PASSWORD 注入。
+  # 仅用字母/数字/下划线，避免干扰 MySQL DSN 中的 @ : 分隔符。
+  # 禁止提交真实值；部署前自行替换占位符 <>
+  dbPassword: "<>"
+
+  # 【可选】Redis 口令：内置 Redis 未设置 requirepass 时留空；外接有口令 Redis 时填入
+  redisPassword: ""
+
+  # 【必填】云鸮终端 Agent 共享鉴权 Token：后端 <-> 终端 Pod 之间的 WebSocket 握手凭据。
+  # 后端与终端 Pod 必须一致；轮换时同步改这里并重启两端。
+  # 两侧均无内置默认值兜底，任一侧为空会拒绝启动/拒绝握手。
+  # 禁止提交真实值；部署前自行替换占位符 <>
+  agentToken: "<>"
+
+  # 【可选】飞书回调（任一非空即可开启校验；二者都为空且 callbackAllowUnverified=false 时端点拒绝）
+  feishuVerificationToken: ""
+  feishuEncryptKey: ""
+
+---
+# =============================================================================
+#                          §3  ConfigMap (service)
+# =============================================================================
+# 由 §6 Deployment 挂载到 /app/config/config.yaml，进程内 Server/Database/Redis
+# 等配置均来自此文件。pass 字段留空，由环境变量 WATCHOWL_DB_PASSWORD / WATCHOWL_REDIS_PASSWORD 注入。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: watchowl-service-config
+  namespace: watchowl
+  labels:
+    app.kubernetes.io/name: watchowl-service
+    app.kubernetes.io/component: config
+data:
+  config.yaml: |-
+    Server:
+      port: "9001"
+      mode: "release"
+      # 对外访问地址，告警通知中的「查看图表/认领」按钮会拼接此地址
+      # 本地 kind 集群示例：http://localhost:30593
+      externalUrl: ""
+      # 多副本高可用为内置默认行为: replicas 为 1 或 N 都不会重复评估/通知
+      enableMetrics: true
+      # /metrics 端点的 Bearer Token；留空表示 /metrics 免鉴权
+      metricsToken: ""
+      # ★ 安全相关：开放 /api/system/register 无鉴权自助注册端点（默认关闭）。
+      # 一旦开启任何人可为自己签出 super_admin 角色并加入任意租户，等同把平台拱手送人。
+      enableOpenRegister: false
+      # 跨域携带凭证白名单；前后端由同一个 nginx 同源反代，留空即可
+      allowedOrigins: []
+      # 云鸮终端 WebSocket(/api/watchowl/terminal/ws) 允许的来源白名单, 形如 http://localhost:30593
+      # （必须带 scheme 与端口, 精确匹配）。同源请求始终放行; 白名单用于多层代理等导致同源判定不可靠的部署
+      terminalOriginAllowlist: []
+      # 终端 SSH 会话是否校验远端主机密钥(TOFU 首次信任), 默认开启;
+      # 关闭后不做任何主机密钥校验(InsecureIgnoreHostKey), 仅限受控内网联调时临时使用
+      sshHostKeyCheck: true
+      # pprof 调试端点（仅排障时临时打开）
+      enablePprof: false
+      pprofAddr: "127.0.0.1:9999"
+      trustedProxies: []
+      readHeaderTimeout: 5s
+      readTimeout: 30s
+      # 写超时需覆盖 AI 同步接口最长推理耗时(日报/周报生成等可达分钟级),
+      # 30s 会导致 AI 报告类接口 502, 不要调回 30s
+      writeTimeout: 300s
+      idleTimeout: 120s
+      maxHeaderBytes: 1048576
+
+    Database:
+      type: mysql
+      # 内置 MySQL 在 §A；接外部库请改成对应 Host（如 mysql.default.svc.cluster.local）
+      host: watchowl-mysql
+      port: 3306
+      user: root
+      # 明文口令不应写入 ConfigMap，留空 → 环境变量 WATCHOWL_DB_PASSWORD 注入
+      pass: ""
+      dbName: watchowl
+      timeout: 10s
+
+    Redis:
+      # 内置 Redis 在 §B；接外部 Redis 请改成对应 Host
+      host: watchowl-redis
+      port: 6379
+      pass: ""
+      database: 0
+
+    Jwt:
+      expire: 18000
+      # 明文密钥不应写入 ConfigMap，留空 → 环境变量 WATCHOWL_JWT_SIGNKEY 注入
+      signKey: ""
+
+    Login:
+      # 连续失败 N 次后锁定 M 分钟
+      maxFailures: 5
+      lockMinutes: 15
+
+    Alertmanager:
+      # SSRF 防护策略，接监控集群内 Alertmanager 时务必将 Service DNS 加入 allowedHosts
+      allowedHosts: []
+      allowPrivateNetworks: false
+      requestTimeout: "10s"
+
+    Outbound:
+      # 通用 SSRF 白名单：拨测 / Webhook / 自愈 / 数据源都受此项约束。
+      # 裸 "*" 或精确条目表示管理员显式放行: IP 层额外放行 loopback, 但 link-local
+      # (含云元数据 169.254.169.254)/multicast/unspecified 始终硬拦; 私网由 allowPrivateNetworks 裁决。
+      # 默认关闭私网放行以收敛 SSRF 面; 拨测/数据源指向集群内服务(如 .svc.cluster.local)
+      # 时请把目标域名加入 allowedHosts, 或在不信任使用者的部署里评估后再开启 allowPrivateNetworks。
+      allowedHosts: ["*"]
+      allowPrivateNetworks: false
+
+    HistoryEventArchive:
+      enabled: false
+      retentionDays: 90
+      cron: "0 4 * * *"
+      batchDays: 1
+
+    Feishu:
+      callbackVerificationToken: ""
+      callbackEncryptKey: ""
+      callbackAllowUnverified: false
+      callbackSilenceMinutes: 60
+
+---
+# =============================================================================
+#                          §4  ConfigMap (web / nginx)
+# =============================================================================
+# 由 §9 Deployment 挂载到 /etc/nginx/conf.d/watch-owl.conf（nginx 启动时自动加载 conf.d/）。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: watchowl-web-config
+  namespace: watchowl
+  labels:
+    app.kubernetes.io/name: watchowl-web
+    app.kubernetes.io/component: config
+data:
+  nginx.conf: |-
+    server {
+      # 监听 8080(非特权端口): 节点强制 runAsNonRoot/用户命名空间映射时,
+      # 非 root 无法绑定 80, 且镜像内 setcap 文件能力位会在 exec 时被 EPERM 拒绝。
+      # Service 端口仍为 80/NodePort 30593, 外部访问不受影响。
+      listen 8080;
+
+      root /app;
+      index index.html index.htm;
+
+      # 安全响应头: 防 MIME 嗅探(XSS 补充防线)、防被第三方页面 iframe 嵌套(点击劫持)、
+      # 限制 Referrer 只带 origin 不带路径参数。
+      # 注意 nginx 规则: 子 location 只要声明了任何 add_header 就不再继承 server 级的头,
+      # 因此下方已有 add_header 的 location 块内均重复声明了这三行。
+      add_header X-Content-Type-Options "nosniff" always;
+      add_header X-Frame-Options "SAMEORIGIN" always;
+      add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+
+      # 静态产物带内容 hash，长期缓存；缺失时必须 404，
+      # 否则会被 try_files 回退成 index.html，浏览器按 JS 解析会白屏。
+      location /static/ {
+        add_header Cache-Control "public, max-age=31536000, immutable";
+        # 本块已有 add_header, 不再继承 server 级安全头, 在此重复声明
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header X-Frame-Options "SAMEORIGIN" always;
+        add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+        try_files $uri =404;
+      }
+
+      # index.html 必须禁用缓存，否则旧页面持续请求发布后已删除的旧 chunk
+      location = /index.html {
+        add_header Cache-Control "no-cache, no-store, must-revalidate";
+        expires -1;
+
+        # CSP 必须挂在真正返回 HTML 文档的响应上: SPA 路由经 try_files 回退会
+        # internal redirect 到本块, nginx 规则下子块一旦有 add_header 就不再继承
+        # location / 的头, 故 CSP 需在此直接声明
+        add_header Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; font-src 'self' data:; connect-src 'self' ws: wss:; frame-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'" always;
+        # 本块已有 add_header, 不再继承 server 级安全头, 在此重复声明
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header X-Frame-Options "SAMEORIGIN" always;
+        add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+      }
+
+      # /metrics 由后端暴露，经前端 nginx 反代即可由 Prometheus 直接抓
+      location = /metrics {
+        proxy_pass http://watchowl-service:9001/metrics;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_pass_request_headers on;
+      }
+
+      # 通用 SPA 前端路由（history 模式 URL 都交给 index.html）
+      location / {
+        add_header Access-Control-Allow-Origin *;
+        add_header Access-Control-Allow-Methods 'GET, POST, OPTIONS';
+        add_header Access-Control-Allow-Headers 'DNT,X-Mx-ReqToken,Keep-Alive,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type,Authorization';
+        # 本块已有 add_header, 不再继承 server 级安全头, 在此重复声明
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header X-Frame-Options "SAMEORIGIN" always;
+        add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+        try_files $uri $uri/ /index.html;
+      }
+
+      # /api/ 必须带尾斜杠: 纯前缀 "location /api" 会把任何 /api 开头的
+      # SPA 页面路由也劫持进后端(404); 带 / 只代理真正的 API 路径
+      location /api/ {
+        add_header Access-Control-Allow-Origin *;
+        add_header Access-Control-Allow-Methods 'GET, POST, OPTIONS';
+        add_header Access-Control-Allow-Headers 'DNT,X-Mx-ReqToken,Keep-Alive,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type,Authorization';
+        # 本块已有 add_header, 不再继承 server 级安全头, 在此重复声明(代理响应同样生效)
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header X-Frame-Options "SAMEORIGIN" always;
+        add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+        proxy_connect_timeout 300;
+        proxy_read_timeout 300;
+        proxy_send_timeout 300;
+        proxy_buffer_size 128k;
+        proxy_buffers 4 256k;
+        proxy_busy_buffers_size 256k;
+        proxy_request_buffering off;
+        proxy_ssl_server_name on;
+        proxy_ssl_protocols TLSv1.2;
+        proxy_pass http://watchowl-service:9001;
+        # 必须用 $http_host(保留客户端 Host 的完整 host:port)而非 $host(丢端口)。
+        # 与前端 nginx(frontend/watch-owl.conf)保持一致: 经 NodePort 带端口访问时,
+        # 后端 CSRF 同源校验(比对 Origin host:port 与 Host 头)才能通过, 否则写请求会被误判跨站。
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_body $request_body;
+        proxy_pass_request_headers on;
+        # 云鸮终端(kubectl/SSH)通过 /api/watchowl/terminal/ws 建立 WebSocket 长连接,
+        # 必须转发协议升级头, 否则握手以 400 not websocket protocol 失败
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+      }
+
+      error_page 500 502 503 504 /500.html;
+
+      client_max_body_size 2050m;
+      client_body_buffer_size 1024k;
+
+      keepalive_timeout 10;
+    }
+
+---
+# =============================================================================
+#                          §5  ServiceAccount
+# =============================================================================
+# watchowl-service / watchowl-web 当前不需要调 K8s API，因此显式关掉 token 自动挂载
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: watchowl
+  namespace: watchowl
+automountServiceAccountToken: false
+
+---
+# =============================================================================
+#                          §6  Deployment - watchowl-service
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: watchowl-service
+  namespace: watchowl
+  labels:
+    app.kubernetes.io/name: watchowl-service
+    app.kubernetes.io/component: backend
+    app.kubernetes.io/version: "1.0.0"
+    app.kubernetes.io/managed-by: kubectl
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: watchowl-service
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: watchowl-service
+        app.kubernetes.io/component: backend
+    spec:
+      serviceAccountName: watchowl
+      automountServiceAccountToken: false
+      priorityClassName: system-cluster-critical
+      # 同类 Pod 尽量分散到不同节点
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: watchowl-service
+
+      # ---------------- 初始化容器 ----------------
+      # 等待 MySQL + Redis 就绪，否则主容器起来就连不上数据库
+      # busybox 镜像默认 root 启动；为符合 best practice 显式设置 UID / cap drop
+      initContainers:
+        # 等待逻辑带诊断输出与重试上限(~13 分钟):
+        # - 每次失败打印解析到的 Service IP(区分 DNS 失败 vs 连接失败)
+        # - 连接超时 5s, 日志节奏 3s=拒绝(无 endpoints)/8s=丢包(网络不通)一眼可辨
+        # - 超过 100 次退出非零, Pod 显式 Init:Error 而不是无限静默等待
+        - name: wait-for-mysql
+          image: docker.m.daocloud.io/busybox:1.36
+          command: ['sh', '-c']
+          args:
+            - |
+              i=0
+              until nc -z -v -w 5 watchowl-mysql 3306; do
+                i=$((i+1))
+                IP=$(nslookup watchowl-mysql 2>/dev/null | awk '/^Address/{print $NF}' | grep -v ':' | tail -1)
+                echo "[try $i] DNS=${IP:-<resolve-failed>} Waiting for MySQL..."
+                if [ "$i" -ge 100 ]; then
+                  echo "FATAL: watchowl-mysql:3306 unreachable after 100 attempts, giving up."
+                  exit 1
+                fi
+                sleep 3
+              done
+          resources:
+            requests: { cpu: 10m, memory: 16Mi }
+            limits:   { cpu: 50m, memory: 32Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            runAsUser: 65534
+            capabilities: { drop: ["ALL"] }
+            seccompProfile: { type: RuntimeDefault }
+        - name: wait-for-redis
+          image: docker.m.daocloud.io/busybox:1.36
+          command: ['sh', '-c']
+          args:
+            - |
+              i=0
+              until nc -z -v -w 5 watchowl-redis 6379; do
+                i=$((i+1))
+                IP=$(nslookup watchowl-redis 2>/dev/null | awk '/^Address/{print $NF}' | grep -v ':' | tail -1)
+                echo "[try $i] DNS=${IP:-<resolve-failed>} Waiting for Redis..."
+                if [ "$i" -ge 100 ]; then
+                  echo "FATAL: watchowl-redis:6379 unreachable after 100 attempts, giving up."
+                  exit 1
+                fi
+                sleep 3
+              done
+          resources:
+            requests: { cpu: 10m, memory: 16Mi }
+            limits:   { cpu: 50m, memory: 32Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            runAsUser: 65534
+            capabilities: { drop: ["ALL"] }
+            seccompProfile: { type: RuntimeDefault }
+
+      # ---------------- 主容器 ----------------
+      containers:
+        - name: watchowl-service
+          # ★★ 这里改镜像版本（阿里云 ACR 仓库, 多架构 manifest: amd64+arm64）★★
+          # 新版本发布 = 重新 docker tag 并 push 同名 tag, 然后 rollout restart
+          image: registry.cn-beijing.aliyuncs.com/deanmr/watchowl:service
+          # Always: 换机器/换架构部署时避免节点缓存旧架构镜像(exec format error)
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 9001
+              protocol: TCP
+
+          env:
+            # 时区
+            - name: TZ
+              value: Asia/Shanghai
+
+            # -------- 云鸮终端 Agent：后端经 WebSocket 连接终端 Pod 转发交互帧 --------
+            - name: WATCHOWL_TERMINAL_AGENT_URL
+              value: "http://watchowl-terminal:8081"
+            - name: WATCHOWL_TERMINAL_AGENT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: watchowl-secrets
+                  key: agentToken
+
+            # -------- 必填凭据走 Secret（优先级高于 config.yaml 中留空的字段） --------
+            - name: WATCHOWL_JWT_SIGNKEY
+              valueFrom:
+                secretKeyRef:
+                  name: watchowl-secrets
+                  key: jwtSignKey
+            - name: WATCHOWL_DATASOURCE_ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: watchowl-secrets
+                  key: datasourceEncryptionKey
+            - name: WATCHOWL_DATASOURCE_ENCRYPTION_KEY_ID
+              value: "primary"
+            - name: WATCHOWL_DATASOURCE_ENCRYPTION_KEYS
+              valueFrom:
+                secretKeyRef:
+                  name: watchowl-secrets
+                  key: datasourceEncryptionKeys
+            # admin 初始口令【可选】: 默认不注入, 后端跳过建号, 首次打开页面会引导
+            # 设置 admin 密码(公开端点 /api/system/initAdmin)。自动化部署等需要
+            # 预置口令时, 在 watchowl-secrets 里加 adminPassword 键后放开下方注释:
+            # - name: WATCHOWL_ADMIN_PASSWORD
+            #   valueFrom:
+            #     secretKeyRef:
+            #       name: watchowl-secrets
+            #       key: adminPassword
+            - name: WATCHOWL_DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: watchowl-secrets
+                  key: dbPassword
+
+            # -------- 可选凭据：默认空值；如需切换带口令的外部 Redis，把 value 改成 secretKeyRef --------
+            # 当前内置 Redis 未设置 requirepass，留空即可。
+            # 如要接带密码的外置 Redis，改用：
+            #   - name: WATCHOWL_REDIS_PASSWORD
+            #     valueFrom:
+            #       secretKeyRef:
+            #         name: <你的 redis secret 名>
+            #         key: redis-password
+            - name: WATCHOWL_REDIS_PASSWORD
+              value: ""
+
+            # 飞书回调：默认关闭校验 (callbackAllowUnverified=false 时空值会拒绝回调请求)
+            # 任一填非空 + 在 ConfigMap Feishu.callbackAllowUnverified:true 才会放行。
+            - name: WATCHOWL_FEISHU_VERIFICATION_TOKEN
+              value: ""
+            - name: WATCHOWL_FEISHU_ENCRYPT_KEY
+              value: ""
+
+          volumeMounts:
+            - name: config
+              mountPath: /app/config
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+
+          # 启动探针：防止慢启动被 liveness 反复杀掉
+          startupProbe:
+            httpGet:
+              path: /hello
+              port: http
+            periodSeconds: 5
+            failureThreshold: 60   # 5*60 = 300s 启动宽限
+
+          # 就绪探针：通过后才进入 Service Endpoints
+          readinessProbe:
+            httpGet:
+              path: /hello
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            failureThreshold: 6
+
+          # 存活探针：失败重启容器
+          livenessProbe:
+            httpGet:
+              path: /hello
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 6
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            privileged: false
+            readOnlyRootFilesystem: false   # service 可能要写 /tmp
+            runAsNonRoot: false             # 二进制默认以 root 启动时不要限制；如确认非 root，可改 true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+
+      volumes:
+        - name: config
+          configMap:
+            name: watchowl-service-config
+            items:
+              - key: config.yaml
+                path: config.yaml
+        - name: tmp
+          emptyDir: { sizeLimit: 200Mi }
+
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+
+---
+# =============================================================================
+#                          §7  Service - watchowl-service
+# =============================================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: watchowl-service
+  namespace: watchowl
+  labels:
+    app.kubernetes.io/name: watchowl-service
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 9001
+      targetPort: http
+      protocol: TCP
+  selector:
+    app.kubernetes.io/name: watchowl-service
+
+---
+# =============================================================================
+#                          §8  PodDisruptionBudget
+# =============================================================================
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: watchowl-service
+  namespace: watchowl
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: watchowl-service
+
+---
+# =============================================================================
+#                  §8b  云鸮终端 Agent（kubectl / SSH / 自由终端）
+# =============================================================================
+# 三件套设计(与 helm chart terminal-agent/terminal-rbac 一致):
+#   1) ServiceAccount watchowl-terminal: cluster-admin 等高权限只挂在它身上,
+#      后端 SA(watchowl) 保持 automountServiceAccountToken: false 无任何集群权限;
+#   2) 共享鉴权 Token: 存于上方 watchowl-secrets 的 agentToken 字段, 两端必须一致;
+#   3) Deployment + Service: 极简 Agent(--mode=terminal-agent), 在终端 Pod 内拉起
+#      交互式 shell, 后端仅做 WebSocket 帧转发; 会话级 kubeconfig 只写 0600 临时文件。
+# cluster-admin 绑定默认已注释; 仅在需要「kubectl in-cluster 管理本集群」功能时手动放开,
+# 同时须把终端 Deployment 的 automountServiceAccountToken 改回 true(SSH/自由终端不受影响)。
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: watchowl-terminal
+  namespace: watchowl
+  labels:
+    app.kubernetes.io/name: watchowl-terminal
+    app.kubernetes.io/component: terminal
+    app.kubernetes.io/managed-by: kubectl
+
+---
+# ═══════════════════════════════════════════════════════════════════════════
+# ★★★ 高危权限, 默认注释: 下方绑定会把 cluster-admin(全集群读写)授予终端 Pod,
+# 等同让所有能开终端会话的用户 implicit 拿到整个 K8s 集群的控制权, 一旦终端
+# 凭据泄露即等于集群沦陷。仅当明确需要「kubectl in-cluster 管理本集群」功能
+# 且接受该风险时, 才手动取消下方注释, 并同步把下方 Deployment 的
+# automountServiceAccountToken 改回 true。保持注释状态不影响 SSH 与自由终端。
+# ═══════════════════════════════════════════════════════════════════════════
+# apiVersion: rbac.authorization.k8s.io/v1
+# kind: ClusterRoleBinding
+# metadata:
+#   name: watchowl-terminal-cluster-admin
+#   labels:
+#     app.kubernetes.io/name: watchowl-terminal
+#     app.kubernetes.io/managed-by: kubectl
+# subjects:
+#   - kind: ServiceAccount
+#     name: watchowl-terminal
+#     namespace: watchowl
+# roleRef:
+#   apiGroup: rbac.authorization.k8s.io
+#   kind: ClusterRole
+#   name: cluster-admin
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: watchowl-terminal
+  namespace: watchowl
+  labels:
+    app.kubernetes.io/name: watchowl-terminal
+    app.kubernetes.io/component: terminal
+    app.kubernetes.io/version: "1.0.0"
+    app.kubernetes.io/managed-by: kubectl
+spec:
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: watchowl-terminal
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: watchowl-terminal
+        app.kubernetes.io/component: terminal
+    spec:
+      serviceAccountName: watchowl-terminal
+      # 默认不给终端 Pod 挂载 SA token, 先收敛隐式集群凭据(SSH/自由终端用不到);
+      # 需要启用「kubectl in-cluster 管理本集群」时改回 true,
+      # 并同步取消上方 cluster-admin ClusterRoleBinding 的注释
+      automountServiceAccountToken: false
+      containers:
+        - name: terminal-agent
+          # ★ 镜像版本与 service/web 同仓库同发版, 语义 tag: terminal
+          image: registry.cn-beijing.aliyuncs.com/deanmr/watchowl:terminal
+          imagePullPolicy: Always
+          command: ["/app/watch-owl", "--mode=terminal-agent"]
+          env:
+            - name: TZ
+              value: Asia/Shanghai
+            - name: WATCHOWL_TERMINAL_AGENT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: watchowl-secrets
+                  key: agentToken
+            - name: WATCHOWL_TERMINAL_AGENT_ADDR
+              value: ":8081"
+            # 后端服务间调用的固定 Origin 标识, 加入白名单放行
+            - name: WATCHOWL_TERMINAL_ALLOWED_ORIGINS
+              value: "http://watchowl-service"
+          ports:
+            - name: agent
+              containerPort: 8081
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8081
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8081
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 5
+          resources:
+            requests:
+              cpu: 16m
+              memory: 32Mi
+            limits:
+              cpu: "1"
+              memory: 256Mi
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            runAsGroup: 65534
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            seccompProfile: { type: RuntimeDefault }
+          volumeMounts:
+            # 会话级临时文件(kubeconfig 0600 等)写入 emptyDir, 根文件系统保持只读
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: watchowl-terminal
+  namespace: watchowl
+  labels:
+    app.kubernetes.io/name: watchowl-terminal
+    app.kubernetes.io/component: terminal
+    app.kubernetes.io/managed-by: kubectl
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: watchowl-terminal
+  ports:
+    - name: agent
+      port: 8081
+      targetPort: agent
+      protocol: TCP
+
+---
+# ★ 安全警告: 此策略默认未开启, 终端 Pod 当前可被命名空间内任意负载直达(8081),
+# 出网也不受限制; 生产环境建议启用(CNI 需支持 NetworkPolicy), 把出入面收口到白名单。
+# 网络收口(可选, 默认注释——与本清单 §13 策略一致, 开启会要求 CNI 支持 NetworkPolicy):
+# 仅后端可入终端 Pod; 终端 Pod 出网仅放行 DNS 与 443(API Server / kubeconfig 目标集群)。
+# kind: NetworkPolicy
+# metadata:
+#   name: watchowl-terminal
+#   namespace: watchowl
+# spec:
+#   podSelector:
+#     matchLabels:
+#       app.kubernetes.io/name: watchowl-terminal
+#   policyTypes:
+#     - Ingress
+#     - Egress
+#   ingress:
+#     - from:
+#         - podSelector:
+#             matchLabels:
+#               app.kubernetes.io/name: watchowl-service
+#       ports:
+#         - port: 8081
+#           protocol: TCP
+#   egress:
+#     - to:
+#         - namespaceSelector: {}
+#       ports:
+#         - port: 53
+#           protocol: UDP
+#         - port: 53
+#           protocol: TCP
+#     - to:
+#         - ipBlock:
+#             cidr: 0.0.0.0/0
+#       ports:
+#         - port: 443
+#           protocol: TCP
+
+---
+# =============================================================================
+#                          §9  Deployment - watchowl-web
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: watchowl-web
+  namespace: watchowl
+  labels:
+    app.kubernetes.io/name: watchowl-web
+    app.kubernetes.io/component: frontend
+    app.kubernetes.io/version: "1.0.0"
+    app.kubernetes.io/managed-by: kubectl
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: watchowl-web
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: watchowl-web
+        app.kubernetes.io/component: frontend
+    spec:
+      serviceAccountName: watchowl
+      automountServiceAccountToken: false
+      priorityClassName: system-cluster-critical
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: watchowl-web
+
+      containers:
+        - name: watchowl-web
+          # ★★ 这里改前端镜像版本（阿里云 ACR 仓库, 多架构 manifest: amd64+arm64） ★★
+          image: registry.cn-beijing.aliyuncs.com/deanmr/watchowl:web
+          imagePullPolicy: Always
+          command: ["sh", "-c"]
+          args: ["nginx -g 'daemon off;'"]
+          env:
+            - name: TZ
+              value: Asia/Shanghai
+
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+
+          volumeMounts:
+            - name: nginx-config
+              mountPath: /etc/nginx/conf.d/watch-owl.conf
+              subPath: nginx.conf
+              readOnly: true
+
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits:   { cpu: 500m, memory: 256Mi }
+
+          # 直接 curl /，nginx 默认 200 即视为健康
+          startupProbe:
+            httpGet:
+              path: /
+              port: http
+            periodSeconds: 5
+            failureThreshold: 30     # 5*30 = 150s 启动宽限
+
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 3
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            privileged: false
+            readOnlyRootFilesystem: false  # nginx 需要写 /var/cache /var/run /tmp
+            runAsNonRoot: false
+            capabilities:
+              # drop ALL 后必须补回 nginx root 启动的最小权限集:
+              #   CHOWN       启动时 chown /var/cache/nginx/* 给 worker 用户(101)
+              #   DAC_OVERRIDE/FOWNER  读写/属主校验旁路(缓存目录与 pid 文件)
+              #   SETUID/SETGID       master 降权为 worker 用户
+              #   NET_BIND_SERVICE    兜底绑定 80(当前 nginx.conf 监听 8080, 保留以防改回)
+              drop: ["ALL"]
+              add: ["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETUID", "SETGID", "NET_BIND_SERVICE"]
+            seccompProfile:
+              type: RuntimeDefault
+
+      volumes:
+        - name: nginx-config
+          configMap:
+            name: watchowl-web-config
+            items:
+              - key: nginx.conf
+                path: nginx.conf
+
+      terminationGracePeriodSeconds: 15
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+
+---
+# =============================================================================
+#                          §10 Service - watchowl-web
+# =============================================================================
+# 默认 NodePort 30593，与 helm chart values-kind.yaml 一致，方便本地 kind 集群直接访问。
+# 删除 nodePort 字段即回落到默认 ClusterIP 模式。
+apiVersion: v1
+kind: Service
+metadata:
+  name: watchowl-web
+  namespace: watchowl
+  labels:
+    app.kubernetes.io/name: watchowl-web
+spec:
+  type: NodePort
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      nodePort: 30593          # 与 chart 一致；删除即回落 ClusterIP
+      protocol: TCP
+  selector:
+    app.kubernetes.io/name: watchowl-web
+
+---
+# =============================================================================
+#                          §11  PodDisruptionBudget - watchowl-web
+# =============================================================================
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: watchowl-web
+  namespace: watchowl
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: watchowl-web
+
+---
+# =============================================================================
+#                          §12 Ingress（可选，注释示例）
+# =============================================================================
+# 取消下方整块注释即可启用。生产环境建议通过 Ingress 暴露 80/443，
+# 然后把 §10 的 Service type 改成 ClusterIP 即可。
+#
+# apiVersion: networking.k8s.io/v1
+# kind: Ingress
+# metadata:
+#   name: watchowl-web
+#   namespace: watchowl
+#   annotations:
+#     nginx.ingress.kubernetes.io/proxy-body-size: "2050m"
+#     nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+# spec:
+#   ingressClassName: nginx
+#   tls:
+#     - hosts: [watchowl.example.com]
+#       secretName: watchowl-tls
+#   rules:
+#     - host: watchowl.example.com
+#       http:
+#         paths:
+#           - path: /
+#             pathType: Prefix
+#             backend:
+#               service:
+#                 name: watchowl-web
+#                 port: { number: 80 }
+
+---
+# =============================================================================
+#                §13  NetworkPolicy（可选，默认注释不启用）
+# =============================================================================
+# ★ 安全警告: 本策略默认未开启, 平台各 Pod 的网络出入当前不受任何限制,
+# 生产环境建议按下方说明按需启用并逐步白名单化, 收敛攻击面(单 Pod 失陷后难以横向移动)。
+# ★ 默认不启用, 原因: 监控平台的核心功能依赖集群出站(拨测/Webhook/AI 接口/
+#   飞书钉钉告警通知/拉取远端数据源), 下面的最小白名单会把它们全部掐断。
+#
+# 若你的集群有严格出站管控需求, 取消注释并按需追加 egress 规则
+# (至少放行: DNS 53、MySQL 3306、Redis 6379、目标数据源/通知渠道的 80/443),
+# 同时给 §6 / §9 的 Pod 模板补上 app.kubernetes.io/part-of: watchowl 标签。
+#
+# apiVersion: networking.k8s.io/v1
+# kind: NetworkPolicy
+# metadata:
+#   name: watchowl
+#   namespace: watchowl
+# spec:
+#   podSelector:
+#     matchLabels:
+#       app.kubernetes.io/part-of: watchowl
+#   policyTypes:
+#     - Ingress
+#     - Egress
+#   ingress:
+#     - {}          # 放行全部 ingress(反代流量由 nginx 校验)
+#   egress:
+#     - {}          # ★ 生产收紧前先全放; 需要白名单化再逐条替换本条
+#
+# =============================================================================
+
+---
+# =============================================================================
+#                  §A  内置 MySQL（可选 —— 生产请接外部库）
+# =============================================================================
+# 注: 会话审计录制内容(asciicast v2)自 v2.x 起 gzip 压缩存于库表
+#     watchowl_terminal_session_record, 随库备份, 服务无需独立数据卷。
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: watchowl-mysql-data
+  namespace: watchowl
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: standard                    # kind 默认；生产换成 nfs-client / gp3
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: watchowl-mysql
+  namespace: watchowl
+  labels:
+    app.kubernetes.io/name: watchowl-mysql
+    app.kubernetes.io/component: database
+spec:
+  serviceName: watchowl-mysql-headless
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: watchowl-mysql
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: watchowl-mysql
+        app.kubernetes.io/component: database
+    spec:
+      containers:
+        - name: mysql
+          image: registry.cn-beijing.aliyuncs.com/deanmr/watchowl:mysql
+          # Always: 多架构 manifest, 换架构部署时避免节点缓存旧架构镜像(exec format error)
+          imagePullPolicy: Always
+          args:
+            - --default-authentication-plugin=mysql_native_password
+            - --character-set-server=utf8mb4
+            - --collation-server=utf8mb4_unicode_ci
+          env:
+            - name: MYSQL_ROOT_PASSWORD
+              valueFrom: { secretKeyRef: { name: watchowl-secrets, key: dbPassword } }
+            - name: MYSQL_DATABASE
+              value: watchowl
+          ports:
+            - name: mysql
+              containerPort: 3306
+              protocol: TCP
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/mysql
+          resources:
+            requests: { cpu: 200m, memory: 512Mi }
+            limits:   { cpu: 1000m, memory: 1Gi }
+          # ★ startupProbe 必须有: MySQL 8.0 首次初始化(建系统表空间+redo)在慢盘上常超 60s,
+          #   若 livenessProbe 先行探测会 kill 容器, 初始化中断留下脏数据目录,
+          #   之后每次启动报 MY-012960 (Cannot create redo log files) 死循环。
+          #   startupProbe 通过前不执行 liveness/readiness, 给初始化最长 10 分钟窗口。
+          startupProbe:
+            exec:
+              command: ["sh", "-c", "mysqladmin ping -h 127.0.0.1"]
+            periodSeconds: 10
+            failureThreshold: 60
+            timeoutSeconds: 5
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "mysqladmin ping -h 127.0.0.1"]
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["sh", "-c", "mysqladmin ping -h 127.0.0.1"]
+            periodSeconds: 30
+            timeoutSeconds: 10
+  volumeClaimTemplates:                          # ★ StatefulSet 专属：用 volumeClaimTemplates 自动建 PVC
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: standard
+        resources:
+          requests:
+            storage: 5Gi
+---
+# MySQL 必须有 headless service 才能被 StatefulSet 的 serviceName 解析为 mysql-0.watchowl-mysql-headless
+apiVersion: v1
+kind: Service
+metadata:
+  name: watchowl-mysql-headless
+  namespace: watchowl
+  labels:
+    app.kubernetes.io/name: watchowl-mysql
+spec:
+  clusterIP: None
+  ports:
+    - name: mysql
+      port: 3306
+      targetPort: mysql
+  selector:
+    app.kubernetes.io/name: watchowl-mysql
+---
+# Service 名必须是 watchowl-mysql（与 §3 ConfigMap Database.host 严格一致）
+apiVersion: v1
+kind: Service
+metadata:
+  name: watchowl-mysql
+  namespace: watchowl
+  labels:
+    app.kubernetes.io/name: watchowl-mysql
+spec:
+  type: ClusterIP
+  ports:
+    - name: mysql
+      port: 3306
+      targetPort: mysql
+      protocol: TCP
+  selector:
+    app.kubernetes.io/name: watchowl-mysql
+
+---
+# =============================================================================
+#                  §B  内置 Redis（可选 —— 生产请接外部库）
+# =============================================================================
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: watchowl-redis-data
+  namespace: watchowl
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: standard                    # 与 mysql 相同，生产建议换专用 SSD 类
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: watchowl-redis
+  namespace: watchowl
+  labels:
+    app.kubernetes.io/name: watchowl-redis
+    app.kubernetes.io/component: cache
+spec:
+  serviceName: watchowl-redis-headless
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: watchowl-redis
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: watchowl-redis
+        app.kubernetes.io/component: cache
+    spec:
+      containers:
+        - name: redis
+          image: registry.cn-beijing.aliyuncs.com/deanmr/watchowl:redis
+          # Always: 多架构 manifest, 换架构部署时避免节点缓存旧架构镜像(exec format error)
+          imagePullPolicy: Always
+          command: ["redis-server"]
+          args:
+            - --save
+            - "60"
+            - "1000"
+            - --appendonly
+            - "yes"
+            - --maxmemory
+            - 256mb
+            - --maxmemory-policy
+            - allkeys-lru
+          ports:
+            - name: redis
+              containerPort: 6379
+              protocol: TCP
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits:   { cpu: 500m, memory: 256Mi }
+          readinessProbe:
+            exec: { command: ["redis-cli", "ping"] }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            exec: { command: ["redis-cli", "ping"] }
+            initialDelaySeconds: 15
+            periodSeconds: 20
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: standard
+        resources:
+          requests:
+            storage: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: watchowl-redis-headless
+  namespace: watchowl
+  labels:
+    app.kubernetes.io/name: watchowl-redis
+spec:
+  clusterIP: None
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis
+  selector:
+    app.kubernetes.io/name: watchowl-redis
+---
+# Service 名必须是 watchowl-redis（与 §3 ConfigMap Redis.host 严格一致）
+apiVersion: v1
+kind: Service
+metadata:
+  name: watchowl-redis
+  namespace: watchowl
+  labels:
+    app.kubernetes.io/name: watchowl-redis
+spec:
+  type: ClusterIP
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis
+      protocol: TCP
+  selector:
+    app.kubernetes.io/name: watchowl-redis
