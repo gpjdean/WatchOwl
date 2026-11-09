@@ -6,13 +6,36 @@
 
 <p align="center">
 <a href="https://github.com/gpjdean/WatchOwl/graphs/contributors">
-  <img alt="GitHub contributors" src="https://img.shields.io/github/contributors-anon/watch-owl/WatchOwl"/></a>
-<img alt="GitHub Repo stars" src="https://img.shields.io/github/stars/watch-owl/WatchOwl">
-<img alt="GitHub forks" src="https://img.shields.io/github/forks/watch-owl/WatchOwl">
-<img alt="GitHub Repo issues" src="https://img.shields.io/github/issues/watch-owl/WatchOwl">
-<img alt="GitHub Repo issues closed" src="https://img.shields.io/github/issues-closed/watch-owl/WatchOwl">
-<img alt="License" src="https://img.shields.io/badge/license-Apache--2.0-blue"/>
-<img alt="Arch" src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-critical"/>
+  <img src="https://img.shields.io/github/contributors-anon/gpjdean/WatchOwl?style=for-the-badge&logo=github" alt="Contributors"/>
+</a>
+<a href="https://github.com/gpjdean/WatchOwl/stargazers">
+  <img src="https://img.shields.io/github/stars/gpjdean/WatchOwl?style=for-the-badge&logo=github" alt="Stars"/>
+</a>
+<a href="https://github.com/gpjdean/WatchOwl/forks">
+  <img src="https://img.shields.io/github/forks/gpjdean/WatchOwl?style=for-the-badge&logo=github" alt="Forks"/>
+</a>
+<a href="https://github.com/gpjdean/WatchOwl/issues">
+  <img src="https://img.shields.io/github/issues/gpjdean/WatchOwl?style=for-the-badge&logo=github" alt="Issues"/>
+</a>
+<a href="https://github.com/gpjdean/WatchOwl/issues?q=is%3Aissue+is%3Aclosed">
+  <img src="https://img.shields.io/github/issues-closed/gpjdean/WatchOwl?style=for-the-badge&logo=github" alt="Closed Issues"/>
+</a>
+<br>
+<a href="https://github.com/gpjdean/WatchOwl/blob/main/LICENSE">
+  <img src="https://img.shields.io/badge/license-Apache--2.0-blue?style=for-the-badge" alt="License"/>
+</a>
+<a href="#">
+  <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-critical?style=for-the-badge" alt="Arch"/>
+</a>
+<!-- 下面两个等你配置了CI/打tag之后打开 -->
+<!--
+<a href="https://github.com/gpjdean/WatchOwl/actions">
+  <img src="https://img.shields.io/github/actions/workflow/status/gpjdean/WatchOwl/ci.yml?style=for-the-badge&logo=githubactions" alt="CI"/>
+</a>
+<a href="https://github.com/gpjdean/WatchOwl/releases">
+  <img src="https://img.shields.io/github/v/release/gpjdean/WatchOwl?style=for-the-badge&logo=docker" alt="Release"/>
+</a>
+-->
 </p>
 
 
