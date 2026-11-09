@@ -470,29 +470,6 @@ RabbitMQ / RocketMQ / Etcd / Redis 等「中间件指标」规则，评估语义
 | 导入规则      | 规则组 → 导入（支持 YAML / JSON） |
 | 查看告警历史  | 告警管理 → 历史告警               |
 
-## 🛠️ 从源码构建
-
-### 后端
-
-```bash
-cd backend
-# 直接运行
-make run
-# 编译当前平台
-make build
-# 交叉编译 Linux amd64 / arm64
-make build-linux       # 含 upx 压缩
-make build-linux-arm
-```
-
-### 前端
-
-```bash
-cd frontend
-yarn install
-yarn start             # 开发模式，默认 http://localhost:3000（kind 集群访问入口为 http://localhost:30593）
-yarn build             # 生产构建，产物在 build/
-```
 
 ## ☸️ Kubernetes / Helm 部署
 
